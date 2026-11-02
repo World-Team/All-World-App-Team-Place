@@ -1,0 +1,153 @@
+name: All World Cloudflare APIs, account-auth health, and MCP OAuth smoke test
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+  schedule:
+    - cron: "17 */6 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  smoke-test:
+    name: Verify deployed HTTPS API, OAuth 2.1 PKCE, and MCP tools
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Test public API, OAuth metadata, and end-to-end MCP authorization
+        env:
+          API_BASE_URL: https://all-world-app.docc-samisoliman.workers.dev
+        run: |
+          node --input-type=module <<'NODE'
+          import { createHash, randomBytes } from "node:crypto";
+          const base = process.env.API_BASE_URL;
+          const getJson = async (path) => {
+            const r = await fetch(base + path, { headers: { accept: "application/json" }, signal: AbortSignal.timeout(15000) });
+            const text = await r.text();
+            if (!r.ok) throw new Error(base + path + " returned HTTP " + r.status + ": " + text.slice(0, 300));
+            try { return JSON.parse(text); } catch { throw new Error(path + " did not return JSON"); }
+          };
+          const health = await getJson("/api/plugin/health");
+          if (health.ok !== true || health.service !== "All World API" || health.status !== "healthy" || !health.endpoints.includes("/mcp/chatgpt")) throw new Error("Public health response is incorrect");
+          console.log("PASS public health");
+          const site = await getJson("/api/plugin/site-info");
+          if (site.name !== "All World" || site.mcp_endpoint !== base + "/mcp" || site.mcp_connect_page !== base + "/mcp") throw new Error("Site metadata is incorrect");
+          console.log("PASS public site metadata");
+          const authMeta = await getJson("/.well-known/oauth-authorization-server");
+          for (const key of ["authorization_endpoint", "token_endpoint", "registration_endpoint"]) if (!authMeta[key]?.startsWith(base + "/")) throw new Error("OAuth metadata missing " + key);
+          if (!authMeta.code_challenge_methods_supported.includes("S256")) throw new Error("OAuth server does not advertise PKCE S256");
+          const resourceMeta = await getJson("/.well-known/oauth-protected-resource");
+          if (resourceMeta.resource !== base + "/mcp" || !resourceMeta.authorization_servers.includes(base)) throw new Error("Protected-resource metadata is incorrect");
+          console.log("PASS OAuth discovery metadata");
+          const marketplace = await fetch(base + "/mcp", { redirect:"follow", signal: AbortSignal.timeout(15000) });
+          const marketplaceText = await marketplace.text();
+          if (!marketplace.ok || !marketplaceText.includes("All World MCP Marketplace")) throw new Error("MCP marketplace page failed");
+          console.log("PASS /mcp marketplace");
+          const directPlugin = await fetch(base + "/mcp/chatgpt", { signal: AbortSignal.timeout(15000) });
+          const directText = await directPlugin.text();
+          if (directPlugin.status !== 404 || !directText.includes("open_plugin_settings")) throw new Error("Plugin settings page should require a one-time launch token");
+          console.log("PASS plugin settings URL is gated");
+          const unauth = await fetch(base + "/mcp", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc:"2.0",id:1,method:"initialize",params:{} }), signal: AbortSignal.timeout(15000) });
+          if (unauth.status !== 401 || !unauth.headers.get("www-authenticate")?.includes("oauth-protected-resource")) throw new Error("MCP endpoint must reject requests without a bearer token");
+          console.log("PASS MCP rejects unauthenticated requests");
+          const redirectUri = "http://127.0.0.1:43871/oauth/callback";
+          const registration = await fetch(base + "/oauth/register", { method:"POST", headers:{"content-type":"application/json"}, body:JSON.stringify({client_name:"All World CI Test",redirect_uris:[redirectUri],grant_types:["authorization_code"],response_types:["code"],token_endpoint_auth_method:"none"}), signal:AbortSignal.timeout(15000) });
+          const client = await registration.json();
+          if (registration.status !== 201 || !client.client_id) throw new Error("Dynamic client registration failed: " + JSON.stringify(client));
+          console.log("PASS OAuth dynamic client registration");
+          const verifier = randomBytes(32).toString("base64url");
+          const challenge = createHash("sha256").update(verifier).digest("base64url");
+          const state = randomBytes(18).toString("base64url");
+          const authorize = new URL(base + "/oauth/authorize");
+          for (const [k,v] of Object.entries({response_type:"code",client_id:client.client_id,redirect_uri:redirectUri,code_challenge:challenge,code_challenge_method:"S256",state,scope:"mcp:read"})) authorize.searchParams.set(k,v);
+          const consent = await fetch(authorize, { redirect:"manual", signal:AbortSignal.timeout(15000) });
+          const consentHtml = await consent.text();
+          if (consent.status !== 200 || !consentHtml.includes("Zugriff für ChatGPT bestätigen") || !consentHtml.includes('name="code_challenge"')) throw new Error("OAuth authorization/consent page failed");
+          const consentPost = new URLSearchParams({client_id:client.client_id,redirect_uri:redirectUri,code_challenge:challenge,state});
+          const approved = await fetch(base + "/oauth/authorize", { method:"POST",headers:{"content-type":"application/x-www-form-urlencoded"},body:consentPost,redirect:"manual",signal:AbortSignal.timeout(15000) });
+          if (approved.status !== 302) throw new Error("OAuth approval failed: HTTP " + approved.status + " " + (await approved.text()).slice(0,200));
+          const callback = new URL(approved.headers.get("location"));
+          const code = callback.searchParams.get("code");
+          if (callback.origin + callback.pathname !== redirectUri || !code || callback.searchParams.get("state") !== state) throw new Error("OAuth redirect/code/state validation failed");
+          console.log("PASS OAuth authorization code and state");
+          const tokenResponse = await fetch(base + "/oauth/token", {method:"POST",headers:{"content-type":"application/x-www-form-urlencoded"},body:new URLSearchParams({grant_type:"authorization_code",client_id:client.client_id,redirect_uri:redirectUri,code,code_verifier:verifier}),signal:AbortSignal.timeout(15000)});
+          const token = await tokenResponse.json();
+          if (!tokenResponse.ok || !token.access_token || token.token_type !== "Bearer" || token.resource !== base + "/mcp") throw new Error("OAuth token exchange failed: " + JSON.stringify(token));
+          console.log("PASS OAuth token exchange with PKCE");
+          async function mcp(method, params = {}, id = 1) {
+            const r = await fetch(base + "/mcp", {method:"POST",headers:{"authorization":"Bearer "+token.access_token,"content-type":"application/json",accept:"application/json, text/event-stream"},body:JSON.stringify({jsonrpc:"2.0",id,method,params}),signal:AbortSignal.timeout(15000)});
+            const text = await r.text();
+            if (!r.ok) throw new Error("MCP " + method + " returned HTTP " + r.status + ": " + text.slice(0,300));
+            const data = JSON.parse(text);
+            if (data.jsonrpc !== "2.0" || data.id !== id || data.error) throw new Error("Invalid MCP response: " + text.slice(0,300));
+            return data.result;
+          }
+          const init = await mcp("initialize",{protocolVersion:"2025-03-26",capabilities:{},clientInfo:{name:"all-world-smoke-test",version:"1.1.0"}},10);
+          if (!init.capabilities?.tools) throw new Error("MCP initialize response lacks tools capability");
+          console.log("PASS authenticated MCP initialize");
+          const listed = await mcp("tools/list",{},11);
+          const names = (listed.tools||[]).map(t=>t.name);
+          for (const name of ["get_api_health","get_site_info","open_plugin_settings"]) if (!names.includes(name)) throw new Error("Missing MCP tool: "+name);
+          console.log("PASS authenticated MCP tools/list");
+          const call = await mcp("tools/call",{name:"get_api_health",arguments:{}},12);
+          const data = JSON.parse(call.content?.find(x=>x.type==="text")?.text||"{}");
+          if (data.ok !== true || data.status !== "healthy") throw new Error("get_api_health returned invalid data");
+          console.log("PASS authenticated get_api_health");
+          const siteCall = await mcp("tools/call",{name:"get_site_info",arguments:{}},13);
+          const siteData = JSON.parse(siteCall.content?.find(x=>x.type==="text")?.text||"{}");
+          if (siteData.name !== "All World" || siteData.website !== "https://all-world-app-source-code.docc-samisoliman.workers.dev/") throw new Error("get_site_info returned invalid data");
+          console.log("PASS authenticated get_site_info");
+          const launchCall = await mcp("tools/call",{name:"open_plugin_settings",arguments:{}},14);
+          const launchData = JSON.parse(launchCall.content?.find(x=>x.type==="text")?.text||"{}");
+          if (!launchData.one_time || !launchData.url?.startsWith(base+"/mcp/chatgpt?launch=")) throw new Error("Plugin launch link was not generated");
+          const privatePage = await fetch(launchData.url,{redirect:"manual",signal:AbortSignal.timeout(15000)});
+          const privateText = await privatePage.text();
+          if (!privatePage.ok || !privateText.includes("Plugin-Berechtigungen") || privatePage.headers.get("x-robots-tag")?.includes("noindex")!==true) throw new Error("Private plugin settings page did not load securely");
+          const reusedPage = await fetch(launchData.url,{redirect:"manual",signal:AbortSignal.timeout(15000)});
+          if (reusedPage.status !== 410) throw new Error("Plugin launch link should only work once");
+          console.log("PASS one-time private plugin settings launch");
+          console.log("All World OAuth 2.1 PKCE and MCP end-to-end tests passed.");
+          NODE
+
+      - name: Test deployed account-auth Worker health and provider discovery
+        env:
+          AUTH_API_BASE_URL: https://all-world-auth-api.docc-samisoliman.workers.dev
+        run: |
+          node --input-type=module <<'NODE'
+          const base = process.env.AUTH_API_BASE_URL;
+          async function getJson(path) {
+            const response = await fetch(base + path, {
+              headers: { accept: "application/json" },
+              signal: AbortSignal.timeout(15000)
+            });
+            const text = await response.text();
+            if (!response.ok) throw new Error(base + path + " returned HTTP " + response.status + ": " + text.slice(0, 300));
+            try { return JSON.parse(text); }
+            catch { throw new Error(path + " did not return JSON"); }
+          }
+          const health = await getJson("/api/health");
+          if (health.ok !== true || health.ready !== true || health.service !== "all-world-auth-api") {
+            throw new Error("Account-auth health response is incorrect: " + JSON.stringify(health));
+          }
+          console.log("PASS account-auth /api/health");
+          const ready = await getJson("/api/ready");
+          if (ready.ok !== true || ready.ready !== true || ready.service !== "all-world-auth-api") {
+            throw new Error("Account-auth readiness response is incorrect: " + JSON.stringify(ready));
+          }
+          console.log("PASS account-auth /api/ready");
+          const discovery = await getJson("/api/auth/providers");
+          if (!Array.isArray(discovery.providers) || typeof discovery.oauthAvailable !== "boolean") {
+            throw new Error("Account-auth provider discovery has an invalid response");
+          }
+          if (discovery.providers.some(provider => !provider || typeof provider.id !== "string" || provider.enabled !== true)) {
+            throw new Error("Provider discovery returned an invalid or disabled public provider");
+          }
+          if (discovery.providers.some(provider => ["supercell", "apple"].includes(provider.id.toLowerCase()))) {
+            throw new Error("Unsupported provider appeared in public generic OAuth discovery");
+          }
+          console.log("PASS account-auth provider discovery; configured providers: " + discovery.providers.length);
+          console.log("Account-auth live smoke test passed (read-only; no accounts created or changed).");
+          NODE
