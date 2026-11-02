@@ -1,0 +1,42 @@
+# All World — laufende Plattform-Matrix
+
+**Stand:** 2026-10-28. Statusangaben beruhen nur auf tatsächlich verfügbaren Repository-/Cloudflare-Daten. „Deployment beobachtet“ bedeutet nicht automatisch, dass der Live-Inhalt per HTTP geprüft wurde.
+
+| Plattform | Status | Zielartefakt / Architektur | Build-Anforderungen | Nachweis und Testergebnis | Nächster Schritt |
+|---|---|---|---|---|---|
+| Web | Post-Merge-Deployments in Cloudflare beobachtet; Live-HTTP-Prüfung blockiert | Statische HTML/CSS/JS-Website über bestehenden Cloudflare Worker | Node.js 22; `node scripts/build-site.mjs`; vorhandener Wrangler-Workflow | Merge-Commit [7bb72f1](https://github.com/Sami20178/All-World-App-Source-Code-/commit/7bb72f16a3e75bd7ff990ad62a88d455d6db4f06) übernimmt Space Grotesk für Kategorien und explizite NORMAL/WORLD/CFW-Klassen. PR-Run [#40749562720](https://github.com/Sami20178/All-World-App-Source-Code-/actions/runs/40749562720) baute/validierte das Bundle, übersprang aber Deploy/Live-Schritte im PR-Lauf. Cloudflare bestätigt Deployments `b1d7ee5d-74df-4c6a-b1ca-d91f60cfd0f0` (20:04:26 UTC) und `f231cea2-cf92-4e19-842f-128e9c057ee3` (20:06:20 UTC), neueste Version `01a393cb-07b8-49fb-b12b-29b4d2c0d965` mit 100 % Traffic. Die direkte URL-Prüfung scheiterte an DNS-Auflösung; die sichtbare Änderung ist nicht live-verifiziert. | GitHub-Push-Run-/Commit-Zuordnung prüfen und Live-HTTP-/Routing-/Asset-Prüfung in erreichbarer Umgebung ausführen. |
+| PWA | Dateien vorhanden; reale Installation nicht nachgewiesen | Manifest, Service Worker, statische Web-App; Browserabhängig | Site-Bundle-Build und PWA-Dateivalidierung | PR-Frontend-Validierung #40749562652 erfolgreich für PWA-Dateien und Site-Bundle. Offline-Verhalten, Installationsdialog, Browserkonsole und Geräteansichten nicht auf echten Geräten geprüft. | Chrome/Firefox/Safari soweit verfügbar; Installation, Offline-Fallback und responsive Größen testen. |
+| Android | In Arbeit; neuester Build nicht bestätigt | Debug-APK, Paket `com.allworld.app`; minSdk 23, targetSdk 28; ABI/Native-Libraries des neuesten Artefakts nicht verifiziert | Java 17, Android SDK/API 35, Build Tools 35.0.0, Gradle 8.9 in CI | Main-Commit [4cf4417](https://github.com/Sami20178/All-World-App-Source-Code-/commit/4cf4417b0e72c000e3cb071ee4b795167a14f8de) ändert WebView auf die HTTPS-Website-Origin und schränkt Datei-/Content-Zugriff, Mixed Content und externe Navigation ein. Der kombinierte Commit-Status enthält keine Checks; der verfügbare Run-Lister zeigt nur PR-Runs. Kein neuer APK-Build/Signaturtest bestätigt. Frühere Debug-APK ist veraltet und kein Release-Asset. | Push-Workflow-Lauf für Commit 4cf4417 abrufen, APK bauen/prüfen, auf echtem Android-Gerät installieren und Kernfunktionen testen. |
+| Fire OS / Amazon Fire HD 8, HD 10, Fire Max | Geplant; nicht getestet | Dieselbe Android-APK, wenn Kompatibilität nachgewiesen ist; Fire-Modelle nicht separat paketieren | Android-kompatible APK; genaue Geräte-/Fire-OS-Version, API-Level, CPU-Architektur und WebView-Version pro Testgerät erfassen | Kein echter Installations- oder Funktionstest in diesem Durchlauf. Fire HD 8 und Fire Max nicht getestet. Für das bekannte Fire HD 10 wurde zuvor Fire OS 7.3.3.1 / Android 9 (API 28), ARM64-v8a berichtet; dieser Durchlauf hat das Gerät nicht erneut geprüft. | APK auf Fire HD 10 installieren und Start, Anmeldung, Navigation, Display-Skalierung und Offline-/Netzwerkfehler prüfen; Fire HD 8/Max nur mit tatsächlichen Geräten testen. |
+| Windows | Nicht verfügbar in diesem Audit; nicht gebaut | Native EXE/MSI erst nach Auswahl einer Desktop-Architektur | Windows-Build-Runner, Paketierung und echte Starttests | Kein Windows-Artefakt oder erfolgreicher Windows-Build in den geprüften Ergebnissen gefunden. | Prüfen, ob PWA oder WebView-basierte Desktop-Hülle sinnvoll ist; nur nach echtem Build und Test veröffentlichen. |
+| macOS | Blockiert / nicht gebaut | DMG/PKG oder andere native App nur mit echtem macOS-Build | macOS/Xcode, Apple-Signierung und erforderliche Berechtigungen, soweit native App | Kein macOS-Build oder Starttest bestätigt. | Geeignete macOS-Build-Umgebung und Signierung bereitstellen; keine Windows-/Android-Datei umbenennen. |
+| Linux | Nicht verfügbar in diesem Audit; nicht gebaut | AppImage/DEB/RPM nur wenn native Hülle gewählt wird; Web/PWA bleibt separat | Linux-Build-Runner, Paketierung und Starttests je Architektur | Kein Linux-Installationspaket oder Starttest bestätigt. | Native Paketierung bewerten; echte ARM64/x86_64-Artefakte getrennt prüfen. |
+| iOS/iPadOS | Blockiert / nicht gebaut | Echter signierter iOS-Build, kein APK | macOS/Xcode, Apple-Zertifikate/Provisioning und autorisierte Build-Umgebung | Kein iOS-Build, Signatur oder iPhone/iPad-Test bestätigt. | Erst mit geeigneter Apple-Build-Umgebung beginnen. |
+| Nintendo Switch | Nicht verfügbar; keine Portierung gebaut | Eigenständige, rechtmäßige Portierung erforderlich; Android-APK ist kein Konsolenpaket | Offizielle/legitime Entwicklungsumgebung, passende Runtime, Grafik-/Input-Port und Hardwaretest | Kein Build und kein Gerätetest. | Separate Machbarkeitsprüfung ohne Umgehung von Schutzmaßnahmen oder unzulässige Firmware-/Spieldateien. |
+| Wii U | Nicht verfügbar; keine Portierung gebaut | Eigenständiges Konsolenartefakt, sofern technisch sinnvoll | Passende Toolchain, Architektur-/Runtime-Portierung und Hardwaretest | Kein Build und kein Gerätetest. | Separate Machbarkeitsprüfung. |
+| Wii | Nicht verfügbar; keine Portierung gebaut | Eigenständiges Konsolenartefakt, sofern technisch sinnvoll | Passende Toolchain, Grafik-/Input-Port und Hardwaretest | Kein Build und kein Gerätetest. | Separate Machbarkeitsprüfung. |
+| GameCube | Nicht verfügbar; keine Portierung gebaut | Eigenständiges Konsolenartefakt, sofern technisch sinnvoll | Passende Toolchain, Laufzeit-/Grafik-/Input-Port und Hardwaretest | Kein Build und kein Gerätetest. | Separate Machbarkeitsprüfung. |
+
+## Gemeinsame Release-Gates
+
+- Die nächste Versionsbezeichnung ist nur provisorisch `First Classic 0.0.0.0`; die aktuelle Release-/Tag-Liste konnte in diesem Durchlauf nicht über eine verfügbare GitHub-Aktion erneut vollständig gelesen werden.
+- Kein Release ohne echte, erfolgreich gebaute, signatur-/integritätsgeprüfte und angemessen getestete APK, solange Android Zielplattform bleibt.
+- Ein CI-Job mit `success`, bei dem Deploy-Schritte `skipped` sind, ist kein Produktions-Deployment. Ein Cloudflare-Deployment-Eintrag allein ersetzt keinen HTTP-/Browser-Test.
+- Architekturunterstützung nur dann als bestätigt eintragen, wenn ein entsprechendes Artefakt oder Gerät tatsächlich geprüft wurde.
+- Externe Google Fonts werden derzeit noch referenziert; lokal gespeicherte WOFF2-Dateien und Lizenzhinweise sind nicht bestätigt. Keine Platzhalter-Dateien verwenden.
+- Die Konto-API hat Cloudflare-Bindings `APP_ORIGIN`, D1 `AUTH_DB` und Secret-Binding `RATE_LIMIT_SECRET`; geheime Werte nicht dokumentieren. Live-Register/Login/Logout- und Cookie-/CORS-Tests bleiben offen.
+- Team-Synchronisierung ist blockiert: Schreibzugriff auf das Server-Team-Repository wurde mit 403 verweigert; das Source-Code-Team-Repository liefert 404.
+
+
+## Statusnachtrag 2026-10-30
+
+| Plattform | Status | Nachweis / Einschränkung |
+|---|---|---|
+| Web / Cloudflare Worker | deployed; begrenzte Live-Routenprüfung bestanden | Frontend-Workflow #41115090848 deployte den statischen Worker; die Route-/Inhaltsprüfungen bestanden. Kein Node.js-Server-Deploy daraus ableiten. |
+| Android | Debug-APK gebaut und geprüft; nicht als Download verfügbar | Build und Signatur-/Web-Asset-Prüfungen erfolgreich; GitHub-Artefakt-Upload scheiterte am ausgeschöpften Speicherquota. Kein Release-Asset, kein Gerätetest. |
+| Fire OS | geplant, nicht getestet | Fire HD 8/10/Fire Max nicht auf echter Hardware geprüft. |
+| Windows / macOS / Linux | nicht gebaut | Keine Desktop-Pakete oder Hardwaretests belegt. |
+| iOS/iPadOS | blockiert/nicht gebaut | Apple-Build-Werkzeuge, Zertifikate und Signierung fehlen in dieser Ausführung. |
+| Konsolen | separate Machbarkeitsprüfung offen | Kein Switch-/Wii-U-/Wii-/GameCube-Build oder Hardwaretest. |
+
+Die Web/PWA-Quelle ist vorhanden; Offline-, Browser-, Barrierefreiheits- und responsives Verhalten sind noch nicht vollständig getestet. Lokale WOFF2-Fonts und Lizenzhinweise sind offen. Eine eigene Domain wurde nicht eindeutig zugeordnet: beide vorhandenen Zonen stehen auf `pending`; keine DNS-Änderungen.
