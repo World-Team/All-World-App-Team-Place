@@ -72,3 +72,11 @@ The frontend currently uses `https://all-world-auth-api.docc-samisoliman.workers
 - The latest live smoke test verified `/api/health`, `/api/ready`, and provider discovery. It reported zero configured providers and did not create or change an account.
 - No `OAUTH_PROVIDERS_JSON` binding or email-delivery service is configured. Email verification and password reset remain unavailable; Google, Apple, Microsoft, GitHub, and Roblox are not live sign-in options. Supercell remains excluded.
 - The production D1 schema was inspected read-only. It has no `email_verified` field or verification/reset-token tables. No production account, password, token, or database row was changed.
+
+
+## Preview-Worker-Staging – 2026-11-03
+
+- Der isolierte Worker `all-world-auth-api-preview` wurde aus dem Server-Main-Code hochgeladen. Cloudflare meldete Deployment-ID `779ce21a1ac243c9863eb07e76e723d1` am 03.11.2026 um 19:01:52 UTC.
+- Bindings: D1 `AUTH_DB` zeigt ausschließlich auf `all-world-auth-preview` (`79a0bdac-004d-4fde-becf-d9beb1fc31e5`); `APP_ORIGIN` ist `https://auth-preview.invalid`; `API_PUBLIC_URL` ist die dedizierte Preview-Adresse. Die D1-Datenbank hatte bei der read-only-Prüfung null Anwendungstabellen.
+- workers.dev ist deaktiviert und `previews_enabled=false`. Das erforderliche Secret-Binding `RATE_LIMIT_SECRET` konnte über die aktuelle Cloudflare-Integration nicht angelegt werden. Deshalb den Subdomain-Zugriff nicht aktivieren und keinen Live-Smoke ausführen, bis das Secret sicher gesetzt und anschließend nur der Preview-Worker geprüft wurde.
+- Der Produktions-Worker `all-world-auth-api`, die Produktions-D1 und die produktive Domain wurden nicht verändert. GitHub-CI für PR #16 und der Main-Merge liefen erfolgreich; der Preview-Live-Test bleibt offen.
