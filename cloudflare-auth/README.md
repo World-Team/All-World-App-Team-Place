@@ -72,3 +72,114 @@ The frontend currently uses `https://all-world-auth-api.docc-samisoliman.workers
 - The latest live smoke test verified `/api/health`, `/api/ready`, and provider discovery. It reported zero configured providers and did not create or change an account.
 - No `OAUTH_PROVIDERS_JSON` binding or email-delivery service is configured. Email verification and password reset remain unavailable; Google, Apple, Microsoft, GitHub, and Roblox are not live sign-in options. Supercell remains excluded.
 - The production D1 schema was inspected read-only. It has no `email_verified` field or verification/reset-token tables. No production account, password, token, or database row was changed.
+
+
+## Isolierte Auth-Preview (02.11.2026)
+
+Die Preview ist bewusst ein eigener Worker und eine eigene D1-Datenbank. Sie verwendet **nicht** die Produktionsdatenbank und akzeptiert nur den Test-Origin `https://auth-preview.invalid`. Das Frontend bleibt auf der Produktions-API; es wird keine Produktionskonfiguration geändert.
+
+| Ressource | Preview-Wert |
+|---|---|
+| Worker | `all-world-auth-api-preview` |
+| D1 | `all-world-auth-preview` |
+| D1-ID | `79a0bdac-004d-4fde-becf-d9beb1fc31e5` |
+| Region / Jurisdiction | EU / EEUR |
+| App-Origin | `https://auth-preview.invalid` |
+| API-Origin | `https://all-world-auth-api-preview.docc-samisoliman.workers.dev` |
+
+Die Konfiguration liegt in [`wrangler.preview.jsonc`](./wrangler.preview.jsonc). Sie enthält ausschließlich die Preview-D1-Bindung. `RATE_LIMIT_SECRET` wird als Cloudflare-Secret-Binding gesetzt; sein Wert gehört weder in Git noch in Logs. `OAUTH_PROVIDERS_JSON` bleibt ungesetzt, solange kein Anbieter vollständig eingerichtet und getestet wurde.
+
+### Aktueller Preview-Status (02.11.2026)
+
+- Die isolierte EU-D1-Datenbank wurde angelegt: `all-world-auth-preview` (`79a0bdac-004d-4fde-becf-d9beb1fc31e5`).
+- Der Preview-Worker `all-world-auth-api-preview` wurde in diesem Durchlauf **nicht** bereitgestellt. Die Worker-Liste bestätigt, dass der Script-Name noch nicht existiert.
+- Deshalb sind Preview-URL, Schema-Initialisierung und Live-E2E noch **nicht bestätigt**. Der manuelle Smoke-Job bleibt absichtlich deaktiviert, bis der Worker und sein eigenes `RATE_LIMIT_SECRET`-Binding tatsächlich bereitstehen.
+- Die Produktionsressourcen `all-world-auth-api` und `all-world-auth` wurden nicht verändert. Das Produktions-Frontend bleibt unverändert verbunden.
+
+## Preview bereitstellen
+
+1. Das Worker-Skript aus diesem Verzeichnis mit der Preview-Konfiguration bereitstellen:
+   `npx wrangler@4 deploy --config cloudflare-auth/wrangler.preview.jsonc`
+2. Für den Preview-Worker ein eigenes zufälliges Secret namens `RATE_LIMIT_SECRET` als Secret-Binding hinterlegen. Niemals den Produktionswert wiederverwenden.
+3. Die Preview-Suite ausführen: `node cloudflare-auth/tests/preview-smoke.mjs`.
+4. Nur synthetische Testdaten verwenden. Der Test erstellt ein Konto und löscht es am Ende wieder. Bei einem abgebrochenen Lauf können ausschließlich synthetische Preview-Daten zurückbleiben.
+5. Der Smoke-Test prüft außerdem die Session-Cookie-Attribute `HttpOnly`, `Secure` und `SameSite=None` für den Cross-Origin-Frontend-Aufruf.
+
+Der GitHub-CI-Workflow prüft die Konfiguration per Wrangler-Dry-Run. Der Live-Preview-Test wird ausschließlich manuell über `workflow_dispatch` auf `main` gestartet, nachdem der Preview-Worker tatsächlich bereitgestellt wurde; Pull-Request- und normale Push-Läufe greifen nicht auf die Preview-API zu.
+
+**Produktionsschutz:** Diese Datei enthält absichtlich keinen Produktions-Worker-Namen, keine Produktions-D1-ID und keine Produktions-Secret-Werte. Ein Preview-Deployment darf niemals mit dem MCP-Worker `all-world-app` oder dessen `OAUTH_DB` verbunden werden.
+
+
+## Preview-Worker-Staging – 2026-11-03 (Nachprüfung)
+
+### Cloudflare-Konfiguration – tatsächlich geprüft
+
+- Der isolierte Worker `all-world-auth-api-preview` ist vorhanden. Die aktuelle Cloudflare-Deployment-Liste meldet Deployment `b43e809b-7ee0-4300-bf69-8422190d6132`, Version `0461dcc0-caab-4b9a-9a8f-a3f9e839b12d`, mit 100 % Traffic.
+- Die Preview-Bindings wurden nach Namen und Typ geprüft: `API_PUBLIC_URL`, `APP_ORIGIN`, `AUTH_DB` (D1 `all-world-auth-preview`) und `RATE_LIMIT_SECRET` (Secret Text). Der Secret-Wert wurde nicht gelesen oder dokumentiert.
+- Das eigene `RATE_LIMIT_SECRET` wurde ausschließlich am Preview-Worker gesetzt. Produktions-Secret, Produktions-Worker und MCP-Worker wurden nicht verändert.
+- Eine schreibgeschützte D1-Abfrage vor dem ersten Health-Aufruf zeigte nur die interne Tabelle `_cf_KV`; die Anwendungstabellen waren noch nicht initialisiert. Der Worker führt `CREATE TABLE IF NOT EXISTS` beim ersten Health-/API-Aufruf aus. Es wurde kein SQL-Reset und keine Datenlöschung ausgeführt.
+
+### Korrektur nach erstem Preview-Lauf – 03.11.2026
+
+- Nach dem zweiten Lauf war der HTTPS-Health-/Readiness-Aufruf erfolgreich, die Registrierung antwortete jedoch mit HTTP 500. Der Test hat keine erfolgreiche Registrierung bestätigt.
+- Für den Preview-Worker wurde danach Cloudflare-Observability aktiviert: Logs und Invocation-Logs mit 100-%-Sampling, Real-time Issues aktiviert und Query-Strings in Logs/Traces redigiert. Diese Einstellung gilt nur für `all-world-auth-api-preview`.
+- Der Worker protokolliert im Fehlerpfad ausschließlich Methode, Pfad, interne Stage und Fehlertext/Stack; Request-Bodies, Passwörter und Session-Cookies werden dort nicht protokolliert. Die nächste Preview-Ausführung soll die Ursache anhand dieser Logs eingrenzen.
+- `preview-smoke.mjs` gibt bei fehlgeschlagener Registrierung jetzt zusätzlich den begrenzten, nicht geheimen JSON-Fehlertext aus. Das erleichtert die Diagnose, ohne Zugangsdaten zu protokollieren.
+
+- Der erste GitHub-Preview-Smoke-Lauf [#41701236174](https://github.com/Sami20178/All-World-App/actions/runs/41701236174) bestand die lokale Worker-Validierung, scheiterte aber beim ersten HTTPS-Health-Aufruf. Die anschließende Cloudflare-Prüfung zeigte als Ursache: Das workers.dev-Subdomain-Flag des Preview-Skripts war deaktiviert (`enabled=false`).
+- Ausschließlich für `all-world-auth-api-preview` wurde das Subdomain-Flag auf `enabled=true` gesetzt; `previews_enabled=false` blieb erhalten. Der anschließende GET-Read-back bestätigte genau diese Werte. Der Produktions-Worker wurde nicht geändert.
+- Das separate Preview-Secret `RATE_LIMIT_SECRET` ist als `secret_text` vorhanden. Der Wert wurde nicht gelesen, nicht protokolliert und nicht in Git gespeichert.
+- Der nächste Smoke-Lauf muss nach dieser Korrektur erneut bestätigen, dass Health/Readiness, Schema-Initialisierung und die synthetischen Account-Tests funktionieren. Bis dahin ist die Preview **konfiguriert, aber nicht E2E-bestätigt**.
+
+### Nächster End-to-End-Test
+
+- `cloudflare-auth/tests/preview-smoke.mjs` prüft Health, Readiness, anonyme Zugriffssperre, synthetische Registrierung, E-Mail-Login, Session-Wiederherstellung und -Rotation, falsches Passwort, Logout und Kontolöschung.
+- Der Test verwendet ausschließlich `example.test`-Daten und löscht das synthetische Konto am Ende. Er ist noch **nicht** als erfolgreich ausgeführt bestätigt.
+- Die GitHub-Actions-Verbindung stellt keinen Workflow-Dispatch-Aufruf bereit. Deshalb wird `cloudflare-auth-ci.yml` so angepasst, dass der Preview-Smoke nach erfolgreicher Validierung auch bei einem Main-Push mit Änderungen unter `cloudflare-auth/**` ausgeführt wird; manuelles `workflow_dispatch` bleibt möglich. Pull-Request-Läufe greifen nicht auf die Preview-API zu.
+- Direkte HTTP-Abrufe aus der aktuellen Ausführungsumgebung scheiterten an DNS-Auflösung. Der maßgebliche E2E-Nachweis muss daher aus dem GitHub-Runner stammen.
+
+### Produktion bleibt getrennt
+
+- Produktions-Worker `all-world-auth-api`: Deployment `48823a4b-9ffd-47ff-be23-6070cc853fdf`, Version `91b33834-5905-4c5f-855b-35c6fd5339ad`, 100 % Traffic. Dieser Worker wurde in diesem Durchlauf nicht verändert.
+- Produktions-D1 `all-world-auth` wurde nur lesend geprüft; sieben Anwendungstabellen sind vorhanden. Es wurden keine Nutzerkonten, Passwörter oder Produktionszeilen verändert.
+- `OAUTH_PROVIDERS_JSON` ist nicht konfiguriert; Provider-Discovery meldete zuletzt null aktive Anbieter. E-Mail-Versand, E-Mail-Verifizierung und Passwortzurücksetzung bleiben offen.
+- Google, Apple, Microsoft, GitHub und Roblox sind nicht als live aktiviert bestätigt. Supercell bleibt ausgeschlossen.
+
+## Verifizierte Preview-Nachprüfung – 03.11.2026, 20:36 CET
+
+### Aktiver isolierter Preview-Worker
+
+- Cloudflare listet `all-world-auth-api-preview` mit aktivem Deployment `7e27bbe2-b0e8-4aba-afbc-7d51f36fef11`, Version `00362d75-79ff-4e4a-affa-66ae8d73a3f9`, 100 % Traffic. Der Worker wurde am 03.11.2026 um 19:36:40 UTC bereitgestellt.
+- Die Deployment-Metadaten ordnen die Version PR [#18](https://github.com/Sami20178/All-World-App/pull/18), Commit `dec0ad1b214379b7443337185ecc177fc9009c88`, zu.
+- Die Bindings wurden ausschließlich nach Namen und Typ gelesen: `API_PUBLIC_URL`, `APP_ORIGIN` (`https://auth-preview.invalid`), `AUTH_DB` (die separate EU-D1 `all-world-auth-preview`), `PASSWORD_PEPPER` und `RATE_LIMIT_SECRET`. Beide Secret-Bindings sind vorhanden; ihre Werte wurden nicht gelesen.
+- Die Preview-Subdomain ist aktiviert; `previews_enabled=false` bleibt gesetzt. Produktions-Worker, Produktions-D1, MCP-Worker und DNS wurden nicht verändert.
+- Eine schreibgeschützte D1-Abfrage bestätigte sieben Anwendungstabellen plus die interne Tabelle `_cf_KV`. Die geprüften Zähler waren 0 Benutzer, 0 Sitzungen und 0 OAuth-Identitäten; die Abfrage schrieb keine Zeilen.
+
+### Passwort-KDF: klare Freigabegrenze
+
+- Der PR-#18-Kandidat verwendet PBKDF2-HMAC-SHA-512 mit 100.000 Iterationen, zufälligem 16-Byte-Salt, 64-Byte-Ergebnis und einem separaten serverseitigen `PASSWORD_PEPPER`.
+- Das behebt die beobachtete Workers-WebCrypto-Grenze von maximal 100.000 PBKDF2-Iterationen, erfüllt aber nicht die aktuelle OWASP-Mindestempfehlung von 220.000 Iterationen für PBKDF2-HMAC-SHA-512. Ein Pepper ersetzt keine ausreichende KDF-Arbeitsstufe.
+- Deshalb bleibt der Kandidat ausschließlich Preview-Code und ist **nicht für Produktion freigegeben**. Vor einer Produktionsentscheidung muss eine auf dem tatsächlichen Worker gemessene Argon2id-/scrypt-Variante oder ein geeigneter gehosteter Auth-Dienst bewertet werden.
+- Add-on-Prüfung: [`paulmillr/noble-hashes`](https://github.com/paulmillr/noble-hashes) ist MIT-lizenziert, hat keine Laufzeit-Abhängigkeiten und veröffentlichte Version 2.4.0 am 27.08.2026. Das README warnt jedoch, dass die JavaScript-Argon2-Implementierung langsam ist und Argon2 dort nicht vom ursprünglichen Audit abgedeckt wurde; daher nicht ungeprüft übernehmen. [`7Hazard/cf-hash-wasm`](https://github.com/7Hazard/cf-hash-wasm) ist ein Cloudflare-WASM-Fork, aber seit 16.01.2021 unverändert, ohne Releases und mit nicht eindeutig erkannter Lizenz (`NOASSERTION)); daher nicht übernehmen.
+- Maßgebliche Vorgaben: [OWASP Password Storage Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html). Cloudflare dokumentiert die Worker-CPU- und Speichergrenzen in den [Workers Limits](https://developers.cloudflare.com/workers/platform/limits/).
+
+### E2E-Nachweis
+
+- Der Main-Workflow [#41702164242](https://github.com/Sami20178/All-World-App/actions/runs/41702164242) hatte einen erfolgreichen `preview-smoke`-Job. Er wurde jedoch am 03.11.2026 um 19:19:18 UTC abgeschlossen und liegt damit **vor** dem oben genannten Preview-Deployment um 19:36:40 UTC.
+- Dieser frühere Erfolg bestätigt daher nicht den jetzt aktiven PR-#18-Code. Nach dem Preview-Deployment ist noch ein neuer Smoke-Lauf erforderlich, der Health, Readiness, anonyme Zugriffssperre, Registrierung, E-Mail-Login, Session-Wiederherstellung/-Rotation, falsches Passwort, Logout und Löschung eines synthetischen Kontos gegen genau diese aktive Version prüft.
+- Die Produktions-API bleibt auf dem bestehenden Worker `all-world-auth-api` mit Deployment `48823a4b-9ffd-47ff-be23-6070cc853fdf` und Version `91b33834-5905-4c5f-855b-35c6fd5339ad`. Der Preview-Kandidat wurde nicht auf Produktion ausgerollt.
+
+### Weiter offen
+
+- PRs [#17](https://github.com/Sami20178/All-World-App/pull/17) und [#18](https://github.com/Sami20178/All-World-App/pull/18) sind beide Drafts und zeigen aktuell denselben Head-Commit `dec0ad1`; sie sind nicht gemergt. Die Branch-Bezeichnung `scrypt-kdf` beschreibt den derzeitigen PBKDF2-Code nicht korrekt.
+- E-Mail-Verifizierung, Passwortzurücksetzung und externe OAuth-Anbieter bleiben unimplementiert bzw. nicht konfiguriert. Kein E-Mail-Versanddienst und keine Provider-Konfiguration sind bestätigt; Provider-Discovery in Produktion meldet 0 Anbieter.
+
+### Nachtest nach dem Preview-KDF-Deployment – 03.11.2026, 20:43 CET
+
+- Nach dem Deployment der Version `00362d75-79ff-4e4a-affa-66ae8d73a3f9` lief [Cloudflare Auth Worker validation #41705723031](https://github.com/Sami20178/All-World-App/actions/runs/41705723031) auf Main erfolgreich durch. Sowohl `validate` als auch `preview-smoke` endeten mit `success`.
+- Der Smoke-Log bestätigt: Health, Readiness, anonyme Zugriffssperre, Registrierung, Session-Wiederherstellung, E-Mail-Login, Ablehnung eines falschen Passworts, Session-Rotation, Logout und Kontolöschung.
+- Der Test prüft außerdem CORS für den isolierten Test-Origin sowie die Cookie-Attribute `HttpOnly`, `Secure` und `SameSite=None`. Er verwendet ein synthetisches `example.test`-Konto und löscht es am Ende.
+- Die anschließende schreibgeschützte D1-Zählabfrage bestätigte 0 Benutzer, 0 Sitzungen und 0 OAuth-Identitäten. Es blieben keine Testkonten zurück.
+- Die separaten Main-Läufe [API CI #41705722877](https://github.com/Sami20178/All-World-App/actions/runs/41705722877), [Node server validation #41705722652](https://github.com/Sami20178/All-World-App/actions/runs/41705722652) und [Cloudflare API/OAuth health smoke #41705723094](https://github.com/Sami20178/All-World-App/actions/runs/41705723094) waren ebenfalls erfolgreich.
+- **Grenze:** Dies ist ein erfolgreicher isolierter Preview-HTTP-End-to-End-Test, kein Browser-Test auf einem echten Gerät und keine Produktionsfreigabe. Die KDF-Sicherheitsgrenze (100.000 PBKDF2-SHA-512-Iterationen unter OWASP-Empfehlung), fehlende E-Mail-Verifizierung/Passwortzurücksetzung und 0 konfigurierte OAuth-Provider bleiben bestehen. Produktion wurde nicht verändert.
+
