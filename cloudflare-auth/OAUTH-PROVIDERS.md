@@ -113,3 +113,29 @@ The existing flow uses a one-time random state stored hashed in D1, an HttpOnly/
 - [Roblox OAuth 2.0 overview](https://create.roblox.com/docs/cloud/auth/oauth2-overview) · [Roblox OAuth 2.0 reference](https://create.roblox.com/docs/cloud/auth/oauth2-reference)
 
 **Geprüft:** 09.11.2026. Die Links belegen die offiziellen Protokollanforderungen, nicht eine aktive All-World-Provider-Konfiguration.
+## OIDC-ID-Token-Prüfung – Implementierung auf Branch, noch nicht produktiv
+
+Der Branch `automation/oidc-id-token-validation-2026-11-09` ergänzt eine optionale OIDC-Prüfung für generische Provider:
+
+- Konfiguration nur mit `oidc: true`, HTTPS-`oidcIssuer`, HTTPS-`jwksUrl` und Scope `openid`.
+- Der Start erzeugt eine eigene kryptografische Nonce; in D1 wird nur ihr SHA-256-Hash in `oauth_nonces` gespeichert. Die Nonce wird einmalig verbraucht.
+- Der Callback verlangt ein `id_token`, prüft dessen RS256- oder ES256-Signatur gegen den konfigurierten JWKS-Endpunkt und kontrolliert Issuer, Audience, `azp`, Ablaufzeit, `iat`, `nbf`, `sub` und Nonce.
+- Die UserInfo-`sub` muss mit der verifizierten ID-Token-`sub` übereinstimmen. Fehlerhafte Token werden vor dem Anlegen eines Kontos abgewiesen.
+- Tests decken gültigen Login, fehlende JWKS-Konfiguration, falsche Audience und Signatur mit einem nicht vertrauenswürdigen Schlüssel ab.
+
+**Statusgrenze:** Diese Implementierung liegt nur auf dem genannten Branch. Sie ist weder in Main gemergt noch auf Preview oder Produktion deployed. Es sind weiterhin 0 OAuth-Provider konfiguriert. ES256, JWKS-Key-Rotation/Cache-Verhalten und echte Provider-Callbacks benötigen zusätzliche Tests. Apple bleibt wegen des signierten Client-Secret-JWTs ein separater Adapter; GitHub bleibt OAuth 2.0.
+### Ergänzung: PKCE ist für OIDC verpflichtend
+
+OIDC-Provider werden nur akzeptiert, wenn `pkce` nicht ausdrücklich deaktiviert wurde. Konfigurationen mit `oidc: true` und `pkce: false` werden aus der Providerliste ausgeschlossen. Die Branch-Tests decken zusätzlich ES256/P-256, falsche Nonce, ungültige Audience, einen nicht vertrauenswürdigen Signaturschlüssel sowie fehlende JWKS-/PKCE-Konfiguration ab. Der aktuelle Branch ist noch nicht gemergt oder deployed.
+## Statuskorrektur 09.11.2026, 20:07 UTC – OIDC-Prüfung ist in Main
+
+Die optionale OIDC-ID-Token-Prüfung wurde mit [Server-Commit `4a2be3c`](https://github.com/Sami20178/All-World-App/commit/4a2be3c1939d14d97964274761bdfa8ddd2b24c9) in `main` gemergt. Der frühere Abschnitt „nur auf Branch“ beschreibt den Stand vor diesem Merge.
+
+- Provider-Konfiguration verlangt jetzt `oidc: true`, HTTPS-`oidcIssuer`, HTTPS-`jwksUrl`, Scope `openid` und PKCE.
+- Der Worker bindet eine eigene Nonce an den OAuth-State, speichert nur den SHA-256-Hash in `oauth_nonces`, verbraucht sie einmalig und prüft RS256-/ES256-Signaturen, eindeutige JWKS-Schlüssel, Issuer, Audience, `azp`, Zeitclaims, Nonce sowie den UserInfo-`sub`.
+- Main-Checks für Commit `4a2be3c`: [Node-Validierung #42689936917](https://github.com/Sami20178/All-World-App/actions/runs/42689936917), [API-CI #42689936945](https://github.com/Sami20178/All-World-App/actions/runs/42689936945) und [Cloudflare-Auth-Validierung #42689936859](https://github.com/Sami20178/All-World-App/actions/runs/42689936859) erfolgreich. Der isolierte Preview-Smoke in diesem Lauf war erfolgreich; der Lauf hat aber keinen neuen Worker aus diesem Commit deployed.
+- Produktions-Auth-Worker bleibt Version 6. Kein Provider ist konfiguriert (`OAUTH_PROVIDERS_JSON` fehlt; Provider-Discovery 0). Kein echter Google-, Microsoft-, GitHub- oder Roblox-Callback wurde mit Anbieter-Credentials getestet. Apple bleibt ein separater Adapter.
+- Der Passwort-KDF-Blocker bleibt offen: Produktion verwendet PBKDF2-SHA-256/310.000; die zuvor beobachtete Worker-Grenze lag bei 100.000 Iterationen. Ohne isolierten Remote-Benchmark wird die Produktions-KDF nicht geändert.
+- Keine OAuth-App, Client-ID, Secret, privater Schlüssel, Callback-Registrierung oder produktive D1-Zeile wurde in diesem Schritt angelegt oder verändert.
+
+**Status:** OIDC-Verifikationscode ist in Main und CI-validiert; nicht auf Produktion deployed, kein Provider aktiv, kein vollständiger Account-Lifecycle freigegeben.
