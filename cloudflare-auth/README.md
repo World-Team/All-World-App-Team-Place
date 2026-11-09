@@ -183,3 +183,93 @@ Der GitHub-CI-Workflow prüft die Konfiguration per Wrangler-Dry-Run. Der Live-P
 - Die separaten Main-Läufe [API CI #41705722877](https://github.com/Sami20178/All-World-App/actions/runs/41705722877), [Node server validation #41705722652](https://github.com/Sami20178/All-World-App/actions/runs/41705722652) und [Cloudflare API/OAuth health smoke #41705723094](https://github.com/Sami20178/All-World-App/actions/runs/41705723094) waren ebenfalls erfolgreich.
 - **Grenze:** Dies ist ein erfolgreicher isolierter Preview-HTTP-End-to-End-Test, kein Browser-Test auf einem echten Gerät und keine Produktionsfreigabe. Die KDF-Sicherheitsgrenze (100.000 PBKDF2-SHA-512-Iterationen unter OWASP-Empfehlung), fehlende E-Mail-Verifizierung/Passwortzurücksetzung und 0 konfigurierte OAuth-Provider bleiben bestehen. Produktion wurde nicht verändert.
 
+
+
+## Current production and preview status — 2026-11-04
+
+- Server main is `5075aad90d7b195cbfa1b387c84702e3d3daad9a`. Node validation [#41891608656](https://github.com/Sami20178/All-World-App/actions/runs/41891608656), API CI [#41891608663](https://github.com/Sami20178/All-World-App/actions/runs/41891608663), and read-only Cloudflare API/Auth/MCP smoke [#41891608677](https://github.com/Sami20178/All-World-App/actions/runs/41891608677) passed. The smoke verifies health/readiness/provider discovery, not a successful production account lifecycle.
+- Production Worker remains on deployment `48823a4b-9ffd-47ff-be23-6070cc853fdf`, version `91b33834-5905-4c5f-855b-35c6fd5339ad`, 100% traffic. Its visible bindings are `APP_ORIGIN`, `AUTH_DB`, and `RATE_LIMIT_SECRET`; secret values were not read. No `PASSWORD_PEPPER` or `OAUTH_PROVIDERS_JSON` binding is present.
+- Preview Worker remains isolated on deployment `7e27bbe2-b0e8-4aba-afbc-7d51f36fef11`, version `00362d75-79ff-4e4a-affa-66ae8d73a3f9`, with a separate D1 database and `PASSWORD_PEPPER` binding.
+- Read-only D1 counts in both production and preview: 0 users, 0 sessions, 0 OAuth identities, 0 OAuth states. No production rows were changed.
+- Production provider discovery reports 0 enabled OAuth providers. No transactional mail service is configured; email verification and password reset remain unavailable. Google, Apple, Microsoft, GitHub, and Roblox are not active. Supercell remains excluded.
+
+### KDF decision remains blocked
+
+- The current main Worker source uses PBKDF2-HMAC-SHA-256 with 310,000 iterations. A Cloudflare Worker runtime limit of 100,000 iterations was observed in preview diagnostics; see [Cloudflare workerd issue #1346](https://github.com/cloudflare/workerd/issues/1346). This is a compatibility risk; no destructive production registration test was performed.
+- The preview candidate uses PBKDF2-HMAC-SHA-512 with 100,000 iterations and a pepper. It passes the observed runtime limit but is below OWASP's 220,000 PBKDF2-HMAC-SHA-512 recommendation, so it is not production-approved.
+- [OWASP Password Storage Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html) currently recommends Argon2id (19 MiB, 2 iterations, parallelism 1) or scrypt; PBKDF2-HMAC-SHA-256 requires 600,000 iterations and SHA-512 220,000.
+
+### Add-on assessment
+
+| Project | Verified status | Decision |
+|---|---|---|
+| [Daninet/hash-wasm](https://github.com/Daninet/hash-wasm) 4.12.0 | MIT text in package and LICENSE; last release 2024-11-19; WASM/Argon2id/Web Worker support; no runtime dependencies; GitHub license detector says NOASSERTION. | Not integrated; maintenance freshness and independent audit need review. |
+| [paulmillr/noble-hashes](https://github.com/paulmillr/noble-hashes) 2.4.0 | MIT, updated 2026-09-08, no runtime dependencies; scrypt is in documented audit scope, Argon2 is excluded from the Cure53 audit scope. | Scrypt candidate for an isolated Worker benchmark; no integration yet. |
+| [7Hazard/cf-hash-wasm](https://github.com/7Hazard/cf-hash-wasm) | NOASSERTION license status, last commit 2021-01-16, no releases. | Do not use. |
+
+No add-on was installed or copied. Next step: benchmark a maintained scrypt/Argon2id option in an isolated Worker with CPU, memory, DoS, and Unicode tests before changing production hashing.
+
+
+## Production drift audit (2026-11-09)
+
+The production Worker `all-world-auth-api` was compared with the current `main` source by reading the deployed Worker module through the Cloudflare API. The deployed module differs from the repository in two places:
+
+1. Production contains `authStage = "register.password_hash";` at the OAuth callback's new-account path. That callback function does not have an `authStage` variable in scope; it is declared inside the separate request handler. Reproducing this line in the unit-test branch caused `ReferenceError: authStage is not defined` and the OAuth callback returned `oauth_error=login_failed`. This is a bug, not a valid diagnostic marker. The temporary branch insertion and test instrumentation have been removed; the repository's `main` source does not contain this line.
+2. Production's registration check still permits an empty email address. The repository's `main` source already rejects a missing, malformed, or overlong email address.
+
+- Production deployment: `48823a4b-9ffd-47ff-be23-6070cc853fdf`, Worker version `91b33834-5905-4c5f-855b-35c6fd5339ad` (2026-10-31 21:28:10 UTC; 100% traffic).
+- Production bindings verified by name/type only: `APP_ORIGIN`, `AUTH_DB` (D1), and `RATE_LIMIT_SECRET`. Secret values were not read. `OAUTH_PROVIDERS_JSON` and a transactional email binding are absent.
+- Production D1 was inspected using SELECT-only queries: 7 application tables; 0 users, 0 sessions, 0 OAuth identities, and 0 OAuth states. The `users` table has no `email_verified` column; verification/reset-token tables are absent. No rows were written.
+- The live read-only smoke test [#42572805908](https://github.com/Sami20178/All-World-App/actions/runs/42572805908) passed `/api/health`, `/api/ready`, and provider discovery; it reported 0 configured OAuth providers. It did not exercise registration, login, logout, or browser cookies.
+- Production still uses PBKDF2-HMAC-SHA-256 with 310,000 iterations. Do not change the KDF as part of this email-validation fix. The separate preview KDF work in PRs [#18](https://github.com/Sami20178/All-World-App/pull/18) and [#19](https://github.com/Sami20178/All-World-App/pull/19) is not a production approval.
+
+**Deployment status:** this is documentation/source tracking only. No production Worker or D1 setting was changed in this audit. The current `main` Worker source contains the stricter email check and no undefined OAuth diagnostic assignment, but production remains on the older deployed module. Before production deployment, use a controlled procedure that preserves the existing bindings and runtime settings, then verify the deployed module and run the read-only live smoke test. Email verification/password reset remain unavailable until a transactional mail service and token schema are implemented. Google, Apple, Microsoft, GitHub, and Roblox remain unconfigured; Supercell remains excluded.
+
+
+## Production Auth Worker correction and live verification — 2026-11-09
+
+### Deployment
+
+The production Worker was updated from the current repository source after a read-only comparison found two differences in the deployed module: (1) the live OAuth callback contained an out-of-scope `authStage = "register.password_hash";` assignment that could raise a `ReferenceError`, and (2) the live registration guard allowed an empty email address while `main` required a valid email.
+
+- Source: [`cloudflare-auth/worker.mjs` at commit `0202ccbd`](https://github.com/Sami20178/All-World-App/blob/0202ccbd1b6263e6c8cea40a52c67cdaaa24755f/cloudflare-auth/worker.mjs).
+- Cloudflare version: `df4737b8-e4b2-44a4-a69a-798a8be2b2d9`.
+- Production deployment: `72a69a24-5178-4164-8c13-7af85012e921`, 100% traffic, created 2026-11-09 18:55:23 UTC.
+- Post-deploy module read-back matched the GitHub source file exactly. The email guard is required and the out-of-scope callback assignment is absent.
+- Existing bindings were preserved: `APP_ORIGIN`, `AUTH_DB`, and `RATE_LIMIT_SECRET`. Secret values were not read or written. The production D1 database was not modified.
+- Read-only D1 verification after deployment: 0 users, 0 sessions, 0 OAuth identities, 0 OAuth states; `changed_db=false`, `rows_written=0`.
+
+### Tests
+
+- [Live API/MCP smoke #42675741552](https://github.com/Sami20178/All-World-App/actions/runs/42675741552), attempt 2, passed after deployment. The account-auth checks passed `/api/health`, `/api/ready`, and `/api/auth/providers`; provider discovery returned 0 providers. This test was read-only and created or changed no accounts.
+- [Cloudflare Auth Worker validation #42675741140](https://github.com/Sami20178/All-World-App/actions/runs/42675741140) passed. Its isolated preview E2E covered health, readiness, anonymous-route protection, registration, session restoration, email login, invalid-password rejection, session rotation, logout, and account deletion. The preview uses a separate Worker/D1 and PBKDF2-HMAC-SHA-512 at 100,000 iterations; it does **not** prove production registration works with the production KDF.
+
+### Remaining release blockers
+
+- Production hashing remains PBKDF2-HMAC-SHA-256 with 310,000 iterations. A previous isolated Worker test documented a runtime rejection above 100,000 iterations. No production registration/login E2E has been run after this deployment; KDF compatibility remains unverified and must be resolved before declaring account creation complete.
+- The remote scrypt/Argon2id benchmark in [draft PR #19](https://github.com/Sami20178/All-World-App/pull/19) has not run because the repository Actions secret `CLOUDFLARE_API_TOKEN` is not configured. `@noble/hashes@2.4.0` remains a test-only/dev dependency, not a production password-hashing implementation.
+- No transactional email service or verification/reset-token tables are configured. Email verification and password reset remain unavailable.
+- `OAUTH_PROVIDERS_JSON` is not configured; production discovery returns 0 providers. Google, Apple, Microsoft, GitHub, and Roblox are not active sign-in options. Apple requires its own validated OIDC implementation. Supercell remains excluded.
+- The Node.js/Express server is a separate component and is not confirmed as the production frontend API; the website points to the Cloudflare Auth Worker.
+
+Do not describe the account system as fully complete until production registration/login/session E2E, the production KDF, email verification/reset, and each actually configured OAuth provider have passed their own tests.
+
+
+## Production deployment follow-up — 2026-11-09
+
+Cloudflare read-back after the earlier drift audit now shows a new production deployment:
+
+- Worker: `all-world-auth-api`
+- Deployment: `72a69a24-5178-4164-8c13-7af85012e921`
+- Active version: `df4737b8-e4b2-44a4-a69a-798a8be2b2d9` (100% traffic)
+- Created: `2026-11-09T18:55:23Z`
+- Version metadata links to server commit `0202ccbd1b6263e6c8cea40a52c67cdaaa24755f` and records the message “Deploy source-main auth fixes: require registration email and remove OAuth callback ReferenceError”.
+- Binding names/types were read back only: `APP_ORIGIN` (HTTPS frontend origin), `AUTH_DB` (D1), and `RATE_LIMIT_SECRET` (secret). Secret values were not read. `OAUTH_PROVIDERS_JSON` and a transactional email binding remain absent.
+
+The deployed module read-back contains the required email guard (rejects missing, malformed, or overlong email) and does not contain the previous out-of-scope `authStage = "register.password_hash"` assignment. The callback has its own local diagnostic stage variable. The deployed module still uses PBKDF2-HMAC-SHA-256 with 310,000 iterations.
+
+**Verification boundary:** the deployment and active version were confirmed through Cloudflare's deployment/version API. The successful API-CI run [#42675741570](https://github.com/Sami20178/All-World-App/actions/runs/42675741570) completed before this deployment and is not a post-deploy smoke test. No HTTP registration/login/logout or browser-cookie test after this deployment is confirmed. The production account lifecycle must remain unverified until a post-deploy smoke test runs safely; do not create a real user account for testing.
+
+The KDF remains a release/security blocker: the project previously observed a Worker runtime failure above 100,000 PBKDF2 iterations in isolated preview diagnostics, while production still uses 310,000. The 100,000-iteration PBKDF2-SHA-512 preview candidate remains below the current OWASP PBKDF2-SHA-512 recommendation and is not approved for production. Do not lower the production work factor as a quick fix. Evaluate a Worker-compatible Argon2id/scrypt implementation or a managed auth service with real runtime, memory, concurrency, and migration tests before changing password storage.
+
+Email verification, password reset, and external OAuth remain unavailable until the required token schema, transactional mail service, provider configuration, and end-to-end tests exist.
