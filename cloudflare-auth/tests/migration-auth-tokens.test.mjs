@@ -29,7 +29,7 @@ test("email verification and password reset migration is additive and preserves 
     db.prepare("INSERT INTO sessions (token_hash, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)")
       .run("session-hash", "user-1", now + 60_000, now);
 
-    db.exec(initialSql);
+    db.exec(initialSql); // Apply baseline to an existing database; missing objects are added, existing rows remain.
     db.exec(upgradeSql);
 
     const tables = new Set(db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map(row => row.name));
@@ -53,8 +53,8 @@ test("email verification and password reset migration is additive and preserves 
     const resetColumns = db.pragma("table_info(password_reset_tokens)").map(column => column.name);
     assert.deepEqual(emailColumns, ["token_hash", "user_id", "email_normalized", "expires_at", "created_at", "consumed_at"]);
     assert.deepEqual(resetColumns, ["token_hash", "user_id", "expires_at", "created_at", "consumed_at"]);
-    assert.equal(emailColumns.includes("token"), false);
-    assert.equal(resetColumns.includes("token"), false);
+    assert.equal(emailColumns.includes("token"), false, "raw verification token must not have a database column");
+    assert.equal(resetColumns.includes("token"), false, "raw reset token must not have a database column");
 
     const emailTokenA = "a".repeat(43);
     const emailTokenB = "b".repeat(43);
@@ -70,7 +70,8 @@ test("email verification and password reset migration is additive and preserves 
     insertEmail.run(emailTokenA, "user-1", "sample@example.test", expires, now);
     assert.throws(
       () => insertEmail.run(emailTokenB, "user-1", "sample@example.test", expires, now),
-      /UNIQUE|constraint/i
+      /UNIQUE|constraint/i,
+      "only one active verification token per user/email should exist"
     );
     db.prepare("UPDATE email_verification_tokens SET consumed_at=? WHERE token_hash=?").run(now, emailTokenA);
     insertEmail.run(emailTokenB, "user-1", "sample@example.test", expires, now);
@@ -83,7 +84,8 @@ test("email verification and password reset migration is additive and preserves 
     insertReset.run(resetTokenA, "user-1", expires, now);
     assert.throws(
       () => insertReset.run(resetTokenB, "user-1", expires, now),
-      /UNIQUE|constraint/i
+      /UNIQUE|constraint/i,
+      "only one active reset token per user should exist"
     );
     db.prepare("UPDATE password_reset_tokens SET consumed_at=? WHERE token_hash=?").run(now, resetTokenA);
     insertReset.run(resetTokenB, "user-1", expires, now);
