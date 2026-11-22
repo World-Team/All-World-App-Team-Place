@@ -160,9 +160,12 @@ test("Cloudflare auth Worker validates origin, stores hashed passwords, and supp
   assert.notEqual(stored.password_hash, password, "password must not be stored in plaintext");
   assert.match(stored.password_hash, /^pbkdf2\$310000\$/);
 
+  bindings.AUTH_DB.db.prepare("UPDATE users SET role=? WHERE id=?").run("admin_star_plus", registeredBody.user.id);
   const me = await worker.fetch(request("/api/auth/me", { headers: { Cookie: firstCookie } }), bindings);
   assert.equal(me.status, 200);
-  assert.equal((await body(me)).user.username, "sample_user");
+  const meBody = await body(me);
+  assert.equal(meBody.user.username, "sample_user");
+  assert.equal(meBody.user.role, "admin_star_plus");
 
   const badLogin = await worker.fetch(request("/api/auth/login", {
     method: "POST",
