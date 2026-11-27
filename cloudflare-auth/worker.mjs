@@ -1,3 +1,5 @@
+import { handleMessengerRoute } from "./messenger.mjs";
+
 const COOKIE_NAME = "allworld.sid";
 const SESSION_TTL = 7 * 24 * 60 * 60 * 1000;
 const RATE_WINDOW = 15 * 60 * 1000;
@@ -21,7 +23,25 @@ const SCHEMA = [
   "CREATE TABLE IF NOT EXISTS oauth_states (state_hash TEXT PRIMARY KEY, provider TEXT NOT NULL, code_verifier TEXT, user_id TEXT, expires_at INTEGER NOT NULL, created_at INTEGER NOT NULL)",
   "CREATE INDEX IF NOT EXISTS oauth_states_expiry_idx ON oauth_states(expires_at)",
   "CREATE TABLE IF NOT EXISTS oauth_nonces (state_hash TEXT PRIMARY KEY, nonce_hash TEXT NOT NULL, expires_at INTEGER NOT NULL)",
-  "CREATE INDEX IF NOT EXISTS oauth_nonces_expiry_idx ON oauth_nonces(expires_at)"
+  "CREATE INDEX IF NOT EXISTS oauth_nonces_expiry_idx ON oauth_nonces(expires_at)",
+  "CREATE TABLE IF NOT EXISTS messenger_invitations (id TEXT PRIMARY KEY, sender_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, receiver_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','accepted','declined')), conversation_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, CHECK(sender_id <> receiver_id))",
+  "CREATE INDEX IF NOT EXISTS messenger_invitations_receiver_idx ON messenger_invitations(receiver_id,status,created_at)",
+  "CREATE INDEX IF NOT EXISTS messenger_invitations_sender_idx ON messenger_invitations(sender_id,status,created_at)",
+  "CREATE TABLE IF NOT EXISTS messenger_conversations (id TEXT PRIMARY KEY, kind TEXT NOT NULL DEFAULT 'direct' CHECK(kind IN ('direct','group')), dm_key TEXT UNIQUE, title TEXT, created_by TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+  "CREATE TABLE IF NOT EXISTS messenger_participants (conversation_id TEXT NOT NULL REFERENCES messenger_conversations(id) ON DELETE CASCADE, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, joined_at TEXT NOT NULL, last_read_at TEXT, PRIMARY KEY(conversation_id,user_id))",
+  "CREATE INDEX IF NOT EXISTS messenger_participants_user_idx ON messenger_participants(user_id,conversation_id)",
+  "CREATE TABLE IF NOT EXISTS messenger_group_settings (conversation_id TEXT PRIMARY KEY REFERENCES messenger_conversations(id) ON DELETE CASCADE, visibility TEXT NOT NULL CHECK(visibility IN ('private','public')), pin_salt TEXT NOT NULL, pin_hash TEXT NOT NULL, min_rank TEXT NOT NULL DEFAULT 'member', created_at TEXT NOT NULL)",
+  "CREATE TABLE IF NOT EXISTS messenger_group_requests (id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES messenger_conversations(id) ON DELETE CASCADE, requester_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','accepted','declined')), created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(conversation_id,requester_id))",
+  "CREATE INDEX IF NOT EXISTS messenger_group_requests_conversation_idx ON messenger_group_requests(conversation_id,status,created_at)",
+  "CREATE INDEX IF NOT EXISTS messenger_group_requests_requester_idx ON messenger_group_requests(requester_id,status,created_at)",
+  "CREATE TABLE IF NOT EXISTS messenger_messages (id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES messenger_conversations(id) ON DELETE CASCADE, sender_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, body TEXT NOT NULL, created_at TEXT NOT NULL, edited_at TEXT)",
+  "CREATE INDEX IF NOT EXISTS messenger_messages_conversation_idx ON messenger_messages(conversation_id,created_at)",
+  "CREATE TABLE IF NOT EXISTS messenger_attachments (id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES messenger_conversations(id) ON DELETE CASCADE, message_id TEXT NOT NULL REFERENCES messenger_messages(id) ON DELETE CASCADE, uploader_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, file_name TEXT NOT NULL, content_type TEXT NOT NULL, size_bytes INTEGER NOT NULL, created_at TEXT NOT NULL)",
+  "CREATE INDEX IF NOT EXISTS messenger_attachments_conversation_idx ON messenger_attachments(conversation_id,created_at)",
+  "CREATE TABLE IF NOT EXISTS messenger_attachment_chunks (attachment_id TEXT NOT NULL REFERENCES messenger_attachments(id) ON DELETE CASCADE, chunk_index INTEGER NOT NULL, chunk_data BLOB NOT NULL, PRIMARY KEY(attachment_id,chunk_index))",
+  "CREATE TABLE IF NOT EXISTS messenger_calls (id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES messenger_conversations(id) ON DELETE CASCADE, caller_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, callee_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, media_type TEXT NOT NULL CHECK(media_type IN ('audio','video')), status TEXT NOT NULL CHECK(status IN ('ringing','accepted','declined','ended','missed')), offer_sdp TEXT NOT NULL, answer_sdp TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, ended_at TEXT)",
+  "CREATE INDEX IF NOT EXISTS messenger_calls_callee_idx ON messenger_calls(callee_id,status,created_at)",
+  "CREATE TABLE IF NOT EXISTS messenger_call_ice (id TEXT PRIMARY KEY, call_id TEXT NOT NULL REFERENCES messenger_calls(id) ON DELETE CASCADE, sender_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, candidate_json TEXT NOT NULL, created_at TEXT NOT NULL)"
 ];
 const schemaPromises = new WeakMap();
 
@@ -148,7 +168,7 @@ function publicUser(row) {
     id: row.id,
     username: row.username,
     email: row.email || null,
-    role: row.role === "owner" ? "owner" : row.role === "admin_star_plus" ? "admin_star_plus" : "member",
+    role: ["member","verified","star_creator","creator","moderator","admin","admin_star_plus","owner"].includes(String(row.role || "member").toLowerCase()) ? String(row.role || "member").toLowerCase() : "member",
     createdAt: row.created_at
   };
 }
@@ -747,7 +767,7 @@ async function handle(request, env) {
   let authStage = "route";
   const url = new URL(request.url);
   const path = url.pathname;
-  const authPath = path.startsWith("/api/auth/") || path === "/api/account" || path.startsWith("/api/account/") || path === "/api/health" || path === "/api/ready";
+  const authPath = path.startsWith("/api/auth/") || path.startsWith("/api/messenger/") || path === "/api/account" || path.startsWith("/api/account/") || path === "/api/health" || path === "/api/ready";
   if (!authPath) return json(request, env, { error: "API-Endpunkt nicht gefunden." }, 404);
 
   if (request.method === "OPTIONS") {
@@ -781,6 +801,16 @@ async function handle(request, env) {
     authStage = "schema";
     await ensureSchema(env.AUTH_DB);
     const db = env.AUTH_DB;
+
+    if (path.startsWith("/api/messenger/")) {
+      const required = await requireSession(request, env);
+      if (required.response) return required.response;
+      const messengerResponse = await handleMessengerRoute({
+        request, env, db, userId: required.session.user.id,
+        consumeRateLimit, readJson, json, crypto
+      });
+      if (messengerResponse) return messengerResponse;
+    }
 
     if (request.method === "GET" && path === "/api/auth/providers") {
       const providers = parseOAuthProviders(env);
@@ -1028,11 +1058,27 @@ async function handle(request, env) {
       const passwordOk = password && password.length <= 72 && await verifyPassword(password, required.session.user.password_hash);
       if (!passwordOk) return json(request, env, { error: "Gib zur Bestätigung dein aktuelles Passwort ein." }, 401);
       const userId = required.session.user.id;
-      await db.prepare("DELETE FROM user_data WHERE user_id=?").bind(userId).run();
-      await db.prepare("DELETE FROM account_links WHERE user_id=? OR linked_user_id=?").bind(userId, userId).run();
-      await db.prepare("DELETE FROM oauth_identities WHERE user_id=?").bind(userId).run();
-      await db.prepare("DELETE FROM sessions WHERE user_id=?").bind(userId).run();
-      await db.prepare("DELETE FROM users WHERE id=?").bind(userId).run();
+      // Preserve conversations for their remaining participants. A conversation's
+      // creator is also its current owner, so transfer that reference before the
+      // account row is deleted. Empty conversations are removed in the same batch.
+      // D1 batch is transactional: any failed statement rolls back the full deletion.
+      await db.batch([
+        db.prepare(
+          "UPDATE messenger_conversations SET created_by=(" +
+          "SELECT p.user_id FROM messenger_participants p " +
+          "WHERE p.conversation_id=messenger_conversations.id AND p.user_id<>? " +
+          "ORDER BY p.joined_at ASC,p.user_id ASC LIMIT 1) " +
+          "WHERE created_by=? AND EXISTS(" +
+          "SELECT 1 FROM messenger_participants p " +
+          "WHERE p.conversation_id=messenger_conversations.id AND p.user_id<>?)"
+        ).bind(userId,userId,userId),
+        db.prepare("DELETE FROM messenger_conversations WHERE created_by=?").bind(userId),
+        db.prepare("DELETE FROM user_data WHERE user_id=?").bind(userId),
+        db.prepare("DELETE FROM account_links WHERE user_id=? OR linked_user_id=?").bind(userId,userId),
+        db.prepare("DELETE FROM oauth_identities WHERE user_id=?").bind(userId),
+        db.prepare("DELETE FROM sessions WHERE user_id=?").bind(userId),
+        db.prepare("DELETE FROM users WHERE id=?").bind(userId)
+      ]);
       return json(request, env, { ok: true, deleted: true }, 200, { "Set-Cookie": expiredCookie() });
     }
 

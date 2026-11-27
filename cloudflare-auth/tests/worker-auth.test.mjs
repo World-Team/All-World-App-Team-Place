@@ -18,12 +18,17 @@ class FakeD1 {
       bind(...values) { params = values; return statement; },
       async first() { return owner.db.prepare(sql).get(...params) || null; },
       async all() { return { results: owner.db.prepare(sql).all(...params) }; },
-      async run() {
+      runSync() {
         const result = owner.db.prepare(sql).run(...params);
         return { success: true, meta: { changes: result.changes } };
-      }
+      },
+      async run() { return statement.runSync(); }
     };
     return statement;
+  }
+  async batch(statements) {
+    const execute = this.db.transaction(() => statements.map(statement => statement.runSync()));
+    return execute();
   }
 }
 
@@ -1102,4 +1107,285 @@ test("login endpoint enforces the per-IP attempt limit across different identifi
     41,
     "the IP-level counter must remain persistent across different account identifiers"
   );
+});
+
+test("Worldmessanger invitations require acceptance before online chat and support call signalling", async () => {
+  const bindings = env();
+  const register = async (username, email, ip) => {
+    const response = await worker.fetch(request("/api/auth/register", {
+      method: "POST",
+      headers: { "CF-Connecting-IP": ip },
+      body: JSON.stringify({ username, email, password: "A-long-test-password!" })
+    }), bindings);
+    assert.equal(response.status, 201);
+    return cookieFrom(response);
+  };
+  const aliceCookie = await register("messenger_alice", "messenger-alice@example.test", "192.0.2.61");
+  const bobCookie = await register("messenger_bob", "messenger-bob@example.test", "192.0.2.62");
+  const call = (path, method, cookie, payload) => worker.fetch(request(path, {
+    method,
+    headers: { Cookie: cookie },
+    ...(payload === undefined ? {} : { body: JSON.stringify(payload) })
+  }), bindings);
+
+  const invite = await call("/api/messenger/invitations", "POST", aliceCookie, { username: "messenger_bob" });
+  assert.equal(invite.status, 201);
+  const inviteData = await body(invite);
+  const invitationId = inviteData.invitation.id;
+
+  const incoming = await call("/api/messenger/invitations", "GET", bobCookie);
+  assert.equal((await body(incoming)).invitations[0].direction, "incoming");
+  assert.equal((await call("/api/messenger/chats", "GET", aliceCookie)).status, 200);
+  assert.equal((await body(await call("/api/messenger/chats", "GET", aliceCookie))).chats.length, 0,
+    "a pending invitation must not create an open chat");
+
+  const wrongPerson = await call("/api/messenger/invitations/" + invitationId + "/respond", "POST", aliceCookie, { action: "accept" });
+  assert.equal(wrongPerson.status, 404, "only the invited person may respond");
+
+  const accepted = await call("/api/messenger/invitations/" + invitationId + "/respond", "POST", bobCookie, { action: "accept" });
+  assert.equal(accepted.status, 200);
+  const conversationId = (await body(accepted)).conversationId;
+  assert.ok(conversationId);
+  assert.equal((await body(await call("/api/messenger/chats", "GET", aliceCookie))).chats.length, 1);
+  assert.equal((await body(await call("/api/messenger/chats", "GET", bobCookie))).chats.length, 1);
+
+  const sent = await call("/api/messenger/chats/" + conversationId + "/messages", "POST", aliceCookie, { text: "Hallo aus Worldmessanger!" });
+  assert.equal(sent.status, 201);
+  const received = await call("/api/messenger/chats/" + conversationId + "/messages", "GET", bobCookie);
+  const messages = (await body(received)).messages;
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].text, "Hallo aus Worldmessanger!");
+  assert.equal(messages[0].mine, false);
+
+  const strangerCookie = await register("messenger_eve", "messenger-eve@example.test", "192.0.2.63");
+  const forbidden = await call("/api/messenger/chats/" + conversationId + "/messages", "GET", strangerCookie);
+  assert.equal(forbidden.status, 404, "users outside the conversation must not read its messages");
+
+  const createdCall = await call("/api/messenger/calls", "POST", aliceCookie, {
+    conversationId, mediaType: "audio", offerSdp: "v=0\\r\\no=test-offer"
+  });
+  assert.equal(createdCall.status, 201);
+  const callId = (await body(createdCall)).call.id;
+  const ringing = await call("/api/messenger/calls/incoming", "GET", bobCookie);
+  assert.equal((await body(ringing)).calls[0].id, callId);
+  const answered = await call("/api/messenger/calls/" + callId + "/respond", "POST", bobCookie, {
+    action: "accept", answerSdp: "v=0\\r\\no=test-answer"
+  });
+  assert.equal(answered.status, 200);
+  const callState = await call("/api/messenger/calls/" + callId, "GET", aliceCookie);
+  assert.equal((await body(callState)).call.status, "accepted");
+
+  const ice = await call("/api/messenger/calls/" + callId + "/ice", "POST", aliceCookie, {
+    candidate: { candidate: "candidate:test", sdpMid: "0", sdpMLineIndex: 0 }
+  });
+  assert.equal(ice.status, 201);
+  const remoteIce = await call("/api/messenger/calls/" + callId, "GET", bobCookie);
+  assert.equal((await body(remoteIce)).candidates.length, 1);
+  const ended = await call("/api/messenger/calls/" + callId + "/respond", "POST", aliceCookie, { action: "end" });
+  assert.equal(ended.status, 200);
+});
+
+
+test("Worldmessenger group chats require a PIN, rank eligibility, and owner approval", async () => {
+  const bindings = env();
+  const register = async (username, email, ip) => {
+    const response = await worker.fetch(request("/api/auth/register", {
+      method: "POST",
+      headers: { "CF-Connecting-IP": ip },
+      body: JSON.stringify({ username, email, password: "A-long-test-password!" })
+    }), bindings);
+    assert.equal(response.status, 201);
+    return cookieFrom(response);
+  };
+  const ownerCookie = await register("group_owner", "group-owner@example.test", "192.0.2.71");
+  const memberCookie = await register("group_member", "group-member@example.test", "192.0.2.72");
+  const call = (path, method, cookie, payload) => worker.fetch(request(path, {
+    method,
+    headers: { Cookie: cookie },
+    ...(payload === undefined ? {} : { body: JSON.stringify(payload) })
+  }), bindings);
+
+  const deniedRank = await call("/api/messenger/groups", "POST", memberCookie, {
+    title: "Star Creator only", visibility: "public", pin: "123456", minRank: "star_creator"
+  });
+  assert.equal(deniedRank.status, 403, "members cannot create a group that requires a higher rank");
+
+  const created = await call("/api/messenger/groups", "POST", ownerCookie, {
+    title: "Public Test Group", visibility: "public", pin: "123456", minRank: "member"
+  });
+  assert.equal(created.status, 201);
+  const group = (await body(created)).chat;
+  assert.equal(group.kind, "group");
+  assert.equal(group.visibility, "public");
+
+  const discovered = await call("/api/messenger/groups/discover", "GET", memberCookie);
+  assert.ok((await body(discovered)).groups.some(item => item.id === group.id));
+
+  const wrongPin = await call("/api/messenger/groups/" + group.id + "/request", "POST", memberCookie, { pin: "000000" });
+  assert.equal(wrongPin.status, 403, "incorrect PIN must not create a join request");
+
+  const requested = await call("/api/messenger/groups/" + group.id + "/request", "POST", memberCookie, { pin: "123456" });
+  assert.equal(requested.status, 201);
+  const requestId = (await body(requested)).request.id;
+
+  const inbox = await call("/api/messenger/group-requests", "GET", ownerCookie);
+  assert.equal((await body(inbox)).requests[0].direction, "incoming");
+
+  const accepted = await call("/api/messenger/group-requests/" + requestId + "/respond", "POST", ownerCookie, { action: "accept" });
+  assert.equal(accepted.status, 200);
+  const memberChats = await call("/api/messenger/chats", "GET", memberCookie);
+  assert.ok((await body(memberChats)).chats.some(item => item.id === group.id));
+
+  const privateCreated = await call("/api/messenger/groups", "POST", ownerCookie, {
+    title: "Private Test Group", visibility: "private", pin: "654321", minRank: "member"
+  });
+  assert.equal(privateCreated.status, 201);
+  const privateGroup = (await body(privateCreated)).chat;
+  const privateDiscover = await call("/api/messenger/groups/discover", "GET", memberCookie);
+  assert.ok(!(await body(privateDiscover)).groups.some(item => item.id === privateGroup.id),
+    "private groups must not appear in public discovery");
+  const privateRequest = await call("/api/messenger/groups/" + privateGroup.id + "/request", "POST", memberCookie, { pin: "654321" });
+  assert.equal(privateRequest.status, 201, "private groups can be requested with their shared chat ID and PIN");
+});
+
+
+test("account deletion transfers created conversations and preserves the remaining participant's history", async () => {
+  const bindings = env();
+  const password = "A-long-test-password!";
+  const register = async (username, email, ip) => {
+    const response = await worker.fetch(request("/api/auth/register", {
+      method: "POST",
+      headers: { "CF-Connecting-IP": ip },
+      body: JSON.stringify({ username, email, password })
+    }), bindings);
+    assert.equal(response.status, 201);
+    return cookieFrom(response);
+  };
+
+  const deletingCookie = await register("account_to_delete", "delete-account@example.test", "192.0.2.91");
+  const remainingCookie = await register("remaining_member", "remaining-member@example.test", "192.0.2.92");
+  const remainingMe = await worker.fetch(request("/api/auth/me", {
+    headers: { Cookie: remainingCookie }
+  }), bindings);
+  const remainingUserId = (await body(remainingMe)).user.id;
+
+  const invitationResponse = await worker.fetch(request("/api/messenger/invitations", {
+    method: "POST",
+    headers: { Cookie: remainingCookie },
+    body: JSON.stringify({ username: "account_to_delete" })
+  }), bindings);
+  assert.equal(invitationResponse.status, 201);
+  const invitationId = (await body(invitationResponse)).invitation.id;
+
+  const accepted = await worker.fetch(request("/api/messenger/invitations/" + invitationId + "/respond", {
+    method: "POST",
+    headers: { Cookie: deletingCookie },
+    body: JSON.stringify({ action: "accept" })
+  }), bindings);
+  assert.equal(accepted.status, 200);
+  const conversationId = (await body(accepted)).conversationId;
+
+  const message = await worker.fetch(request("/api/messenger/chats/" + conversationId + "/messages", {
+    method: "POST",
+    headers: { Cookie: remainingCookie },
+    body: JSON.stringify({ text: "Diese Nachricht bleibt erhalten." })
+  }), bindings);
+  assert.equal(message.status, 201);
+
+  const deletingMe = await worker.fetch(request("/api/auth/me", {
+    headers: { Cookie: deletingCookie }
+  }), bindings);
+  const deletingUserId = (await body(deletingMe)).user.id;
+
+  const deleted = await worker.fetch(request("/api/account", {
+    method: "DELETE",
+    headers: { Cookie: deletingCookie },
+    body: JSON.stringify({ password })
+  }), bindings);
+  assert.equal(deleted.status, 200);
+  assert.match(deleted.headers.get("Set-Cookie") || "", /Max-Age=0/);
+
+  const conversation = bindings.AUTH_DB.db.prepare(
+    "SELECT created_by FROM messenger_conversations WHERE id=?"
+  ).get(conversationId);
+  assert.equal(conversation.created_by, remainingUserId, "ownership must move to a remaining participant");
+
+  const participants = bindings.AUTH_DB.db.prepare(
+    "SELECT user_id FROM messenger_participants WHERE conversation_id=?"
+  ).all(conversationId);
+  assert.deepEqual(participants.map(row => row.user_id), [remainingUserId]);
+
+  const preservedMessage = bindings.AUTH_DB.db.prepare(
+    "SELECT body,sender_id FROM messenger_messages WHERE conversation_id=?"
+  ).get(conversationId);
+  assert.equal(preservedMessage.body, "Diese Nachricht bleibt erhalten.");
+  assert.equal(preservedMessage.sender_id, remainingUserId);
+
+  assert.equal(bindings.AUTH_DB.db.prepare("SELECT 1 FROM users WHERE id=?").get(deletingUserId), undefined);
+  assert.equal(bindings.AUTH_DB.db.prepare("SELECT COUNT(*) AS count FROM sessions WHERE user_id=?").get(deletingUserId).count, 0);
+});
+
+test("Worldmessenger group ranks cannot be escalated through usernames and PINs use the server HMAC secret", async () => {
+  const bindings = env();
+  const register = async (username, email, ip) => {
+    const response = await worker.fetch(request("/api/auth/register", {
+      method: "POST",
+      headers: { "CF-Connecting-IP": ip },
+      body: JSON.stringify({ username, email, password: "A-long-test-password!" })
+    }), bindings);
+    assert.equal(response.status, 201);
+    return cookieFrom(response);
+  };
+  const call = (path, method, cookie, payload) => worker.fetch(request(path, {
+    method,
+    headers: { Cookie: cookie },
+    ...(payload === undefined ? {} : { body: JSON.stringify(payload) })
+  }), bindings);
+
+  const samiCookie = await register("sami", "sami-rank@example.test", "192.0.2.81");
+  const yassinCookie = await register("yassin", "yassin-rank@example.test", "192.0.2.82");
+  const ownerEscalation = await call("/api/messenger/groups", "POST", samiCookie, {
+    title: "Testgruppe", visibility: "private", pin: "1234", minRank: "owner"
+  });
+  assert.equal(ownerEscalation.status, 403, "a username must not grant the owner rank");
+  const adminEscalation = await call("/api/messenger/groups", "POST", yassinCookie, {
+    title: "Testgruppe", visibility: "private", pin: "1234", minRank: "admin_star_plus"
+  });
+  assert.equal(adminEscalation.status, 403, "a username must not grant an administrator rank");
+
+  const starCreatorCookie = await register("role_star_creator", "role-star-creator@example.test", "192.0.2.84");
+  bindings.AUTH_DB.db.prepare("UPDATE users SET role='star_creator' WHERE username_normalized='role_star_creator'").run();
+  const starCreatorMe = await call("/api/auth/me", "GET", starCreatorCookie);
+  assert.equal((await body(starCreatorMe)).user.role, "star_creator");
+  const starCreatorGroup = await call("/api/messenger/groups", "POST", starCreatorCookie, {
+    title: "Star Creator Group", visibility: "private", pin: "2345", minRank: "star_creator"
+  });
+  assert.equal(starCreatorGroup.status, 201);
+
+  const roleOwnerCookie = await register("role_owner", "role-owner@example.test", "192.0.2.83");
+  bindings.AUTH_DB.db.prepare("UPDATE users SET role='owner' WHERE username_normalized='role_owner'").run();
+  const created = await call("/api/messenger/groups", "POST", roleOwnerCookie, {
+    title: "Sichere Testgruppe", visibility: "private", pin: "123456", minRank: "owner"
+  });
+  assert.equal(created.status, 201, "a trusted database role may grant the configured rank");
+  const chat = (await body(created)).chat;
+  const stored = bindings.AUTH_DB.db.prepare(
+    "SELECT pin_salt,pin_hash FROM messenger_group_settings WHERE conversation_id=?"
+  ).get(chat.id);
+  assert.ok(stored);
+
+  const key = await webcrypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(bindings.RATE_LIMIT_SECRET),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const mac = await webcrypto.subtle.sign(
+    "HMAC",
+    key,
+    new TextEncoder().encode(stored.pin_salt + ":123456")
+  );
+  const expected = Array.from(new Uint8Array(mac), byte => byte.toString(16).padStart(2,"0")).join("");
+  assert.equal(stored.pin_hash, expected, "the stored PIN hash must use the server-side HMAC secret");
 });
